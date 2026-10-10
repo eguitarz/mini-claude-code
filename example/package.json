@@ -1,0 +1,1 @@
+{ "name": "buggy-example", "type": "module", "scripts": { "test": "node --test" } }
