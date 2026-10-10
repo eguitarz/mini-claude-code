@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Minimum Claude Code: a while-loop agent with three tools, a bounded context, and y/n permissions.
 // Usage (from inside the repo you want fixed):  node /path/to/src/agent.ts "fix the failing tests"
+// Backend: the Messages API if ANTHROPIC_API_KEY is set, otherwise `claude -p` on your Claude subscription.
 import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, Tool, ToolResultBlockParam, ToolUseBlock } from "@anthropic-ai/sdk/resources/messages";
+import type { MessageParam, Tool, ToolResultBlockParam } from "@anthropic-ai/sdk/resources/messages";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -14,6 +15,7 @@ const MAX_CONTEXT_CHARS = Number(process.env.MCC_MAX_CONTEXT_CHARS ?? 120_000); 
 const MAX_TOOL_OUTPUT_CHARS = 20_000;
 const MAX_TURNS = 50;
 const CWD = process.cwd();
+const USE_API = Boolean(process.env.ANTHROPIC_API_KEY);
 
 const c = { dim: "\x1b[2m", cyan: "\x1b[36m", yellow: "\x1b[33m", red: "\x1b[31m", green: "\x1b[32m", reset: "\x1b[0m" };
 const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -113,8 +115,8 @@ async function runShell(command: string): Promise<ToolOutput> {
   return { content: clip(out), isError: r.status !== 0 };
 }
 
-async function runTool(call: ToolUseBlock): Promise<ToolOutput> {
-  const input = call.input as Record<string, string>;
+async function runTool(call: ToolCall): Promise<ToolOutput> {
+  const input = call.input;
   try {
     switch (call.name) {
       case "read_file":
@@ -164,18 +166,84 @@ Workflow for fixing bugs:
 4. Re-run the tests. Repeat until they all pass.
 Finish with a short summary of the cause and the fix. Be concise.`;
 
-const client = new Anthropic();
+// ---------- model backends ----------
+
+type ToolCall = { type: "tool_use"; id: string; name: string; input: Record<string, string> };
+type Block = { type: "text"; text: string } | ToolCall;
+
+async function callModel(messages: MessageParam[]): Promise<Block[]> {
+  return USE_API ? callApi(messages) : callClaudeCli(messages);
+}
+
+async function callApi(messages: MessageParam[]): Promise<Block[]> {
+  const res = await new Anthropic().messages.create({ model: MODEL, max_tokens: MAX_TOKENS, system: SYSTEM, tools, messages });
+  return res.content.flatMap((b): Block[] =>
+    b.type === "text" ? [{ type: "text", text: b.text }]
+    : b.type === "tool_use" ? [{ type: "tool_use", id: b.id, name: b.name, input: b.input as Record<string, string> }]
+    : []);
+}
+
+// `claude -p` has no client-side tools, so the model writes ```tool JSON blocks that we parse
+// into the same tool_use blocks the API would return. The rest of the loop doesn't know the difference.
+const TOOL_PROTOCOL = `
+To call tools, end your reply with one or more fenced blocks like this, then stop:
+\`\`\`tool
+{"name": "run_shell", "input": {"command": "npm test"}}
+\`\`\`
+Tools:
+${tools.map((t) => `- ${t.name}: ${t.description} Input: ${JSON.stringify(t.input_schema.properties)}`).join("\n")}
+Results come back in <tool_result> tags. Never write a <tool_result> yourself. Reply with no tool block when you are done.
+You get the conversation as a transcript; write only your next assistant turn.`;
+
+function toTranscript(messages: MessageParam[]): string {
+  return messages
+    .flatMap((m) => {
+      if (typeof m.content === "string") return [`<user>\n${m.content}\n</user>`];
+      return m.content.map((b) => {
+        if (b.type === "text") return `<assistant>\n${b.text}\n</assistant>`;
+        if (b.type === "tool_use") return `<assistant>\n\`\`\`tool\n${JSON.stringify({ name: b.name, input: b.input })}\n\`\`\`\n</assistant>`;
+        if (b.type === "tool_result") return `<tool_result>\n${b.content}\n</tool_result>`;
+        return "";
+      });
+    })
+    .join("\n\n");
+}
+
+async function callClaudeCli(messages: MessageParam[]): Promise<Block[]> {
+  const args = ["-p", "--output-format", "json", "--model", MODEL, "--system-prompt", SYSTEM + TOOL_PROTOCOL,
+    "--tools", "", "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence"];
+  const r = spawnSync("claude", args, { input: toTranscript(messages), encoding: "utf8", maxBuffer: 50 * 1024 * 1024 });
+  if (r.error) throw new Error(`could not run claude: ${r.error.message}`);
+  let out: { result?: string; is_error?: boolean };
+  try { out = JSON.parse(r.stdout); } catch { throw new Error(`claude -p failed: ${r.stderr || r.stdout}`); }
+  if (out.is_error || typeof out.result !== "string") throw new Error(`claude -p failed: ${out.result ?? r.stdout}`);
+
+  const fence = /```tool\s*\n([\s\S]*?)\n```/g;
+  const firstTool = out.result.search(fence);
+  const text = (firstTool === -1 ? out.result : out.result.slice(0, firstTool)).replace(/<\/?assistant>/g, "").trim();
+  const blocks: Block[] = text ? [{ type: "text", text }] : [];
+  for (const [, json] of out.result.matchAll(fence)) {
+    const id = `toolu_${blocks.length}_${Date.now()}`;
+    try {
+      const { name, input } = JSON.parse(json);
+      blocks.push({ type: "tool_use", id, name, input });
+    } catch {
+      blocks.push({ type: "tool_use", id, name: "invalid_tool_call", input: { raw: json } });
+    }
+  }
+  return blocks;
+}
 
 async function agent(messages: MessageParam[]): Promise<void> {
   let turns = 0;
   while (turns++ < MAX_TURNS) {
     trimContext(messages);
-    const res = await client.messages.create({ model: MODEL, max_tokens: MAX_TOKENS, system: SYSTEM, tools, messages });
-    messages.push({ role: "assistant", content: res.content });
+    const content = await callModel(messages);
+    messages.push({ role: "assistant", content });
 
-    for (const block of res.content) if (block.type === "text") console.log(`\n${block.text}\n`);
+    for (const block of content) if (block.type === "text") console.log(`\n${block.text}\n`);
 
-    const calls = res.content.filter((b): b is ToolUseBlock => b.type === "tool_use");
+    const calls = content.filter((b): b is ToolCall => b.type === "tool_use");
     if (calls.length === 0) return; // model is done (or wants the user)
 
     const results: ToolResultBlockParam[] = [];
@@ -191,7 +259,7 @@ async function agent(messages: MessageParam[]): Promise<void> {
 async function main(): Promise<void> {
   const messages: MessageParam[] = [];
   let task = process.argv.slice(2).join(" ").trim();
-  console.log(`${c.dim}mini claude code · ${MODEL} · ${CWD} · ctrl+c to quit${c.reset}`);
+  console.log(`${c.dim}mini claude code · ${MODEL} via ${USE_API ? "API key" : "claude -p (subscription)"} · ${CWD} · ctrl+c to quit${c.reset}`);
   while (true) {
     if (!task) task = (await rl.question(`${c.green}> ${c.reset}`)).trim();
     if (!task) continue;
