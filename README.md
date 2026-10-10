@@ -27,4 +27,19 @@ Subscription use is for your own personal use. Anthropic doesn't allow apps to o
 Node 24+ runs the `.ts` file directly. With no argument it opens a `>` prompt; type `exit` to quit.
 Env: `MCC_MODEL` (default `claude-opus-5-5`), `MCC_MAX_CONTEXT_CHARS`.
 
-`example/` is a small repo with an off-by-one bug in `sum()`. `npm test` there fails 2 of 3 tests.
+## Try it
+
+`example/` has an off-by-one bug in `sum()`, so 2 of its 3 tests fail.
+
+```bash
+cd example
+npm test                                      # pass 1, fail 2
+node ../src/agent.ts "fix the failing tests"  # answer y to each prompt
+npm test                                      # pass 3, fail 0
+git checkout .                                # put the bug back
+```
+
+Also try:
+- Answer `n` to a prompt. The agent stops and asks what to do instead.
+- Run with `MCC_MAX_CONTEXT_CHARS=2000` to see old tool outputs dropped (`[context] dropped an old tool output`).
+- Run it from inside your own repo: `node /path/to/src/agent.ts "fix the failing tests"`. Use a repo you can reset, since it overwrites files after you approve.
