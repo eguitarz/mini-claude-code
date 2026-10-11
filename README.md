@@ -2,6 +2,8 @@
 
 A ~280-line CLI coding agent in one file: [src/agent.ts](src/agent.ts).
 
+![The agent fixes the bug in example/ and the tests go green](demo/demo.gif)
+
 | Component  | How it works |
 |------------|--------------|
 | Loop       | `while` loop: call the model → run every `tool_use` → send back `tool_result`s → repeat until the model stops calling tools (max 50 turns). |
